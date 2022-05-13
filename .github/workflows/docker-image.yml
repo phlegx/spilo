@@ -1,6 +1,10 @@
-name: Build and push Docker image Postgres v13, Spilo 2.1-p1, Timescale 2.4.1
+name: Build and push Docker image
 
 on: workflow_dispatch
+
+env:
+  spilo-version: '2.1-p1'
+  postgres-version: '13'
 
 jobs:
   push_to_registry:
@@ -10,7 +14,7 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v3
         with:
-          ref: 2.1-p1
+          ref: "${{ env.spilo-version }}"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
@@ -29,8 +33,8 @@ jobs:
         with:
           context: ./postgres-appliance
           push: true
-          tags: latest,2.1-p1
+          tags: latest,"${{ env.spilo-version }}"
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            PGVERSION=13
+            PGVERSION="${{ env.postgres-version }}"
             TIMESCALEDB_APACHE_ONLY=false
