@@ -14,7 +14,7 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v3
         with:
-          ref: "${{ env.spilo-version }}"
+          ref: ${{ env.spilo-version }}
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
@@ -33,7 +33,7 @@ jobs:
         with:
           context: ./postgres-appliance
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: phlegx/spilo-${{ env.postgres-version }}:${{ env.spilo-version }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             PGVERSION=${{ env.postgres-version }}
