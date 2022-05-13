@@ -33,7 +33,7 @@ jobs:
         with:
           context: ./postgres-appliance
           push: true
-          tags: ${{ env.spilo-version }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             PGVERSION=${{ env.postgres-version }}
