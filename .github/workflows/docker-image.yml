@@ -3,8 +3,8 @@ name: Build and push Docker image
 on: workflow_dispatch
 
 env:
-  spilo-version: '2.1-p1'
-  postgres-version: '13'
+  spilo-version: '2.1-p5'
+  postgres-version: '14'
 
 jobs:
   push_to_registry:
