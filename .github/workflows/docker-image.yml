@@ -33,8 +33,8 @@ jobs:
         with:
           context: ./postgres-appliance
           push: true
-          tags: latest,"${{ env.spilo-version }}"
+          tags: ${{ env.spilo-version }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            PGVERSION="${{ env.postgres-version }}"
+            PGVERSION=${{ env.postgres-version }}
             TIMESCALEDB_APACHE_ONLY=false
