@@ -33,8 +33,7 @@ PROVIDER_LOCAL = "local"
 PROVIDER_UNSUPPORTED = "unsupported"
 USE_KUBERNETES = os.environ.get('KUBERNETES_SERVICE_HOST') is not None
 KUBERNETES_DEFAULT_LABELS = '{"application": "spilo"}'
-MEMORY_LIMIT_IN_BYTES_PATH = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
-PATRONI_DCS = ('zookeeper', 'exhibitor', 'consul', 'etcd3', 'etcd')
+PATRONI_DCS = ('kubernetes', 'zookeeper', 'exhibitor', 'consul', 'etcd3', 'etcd')
 AUTO_ENABLE_WALG_RESTORE = ('WAL_S3_BUCKET', 'WALE_S3_PREFIX', 'WALG_S3_PREFIX', 'WALG_AZ_PREFIX', 'WALG_SSH_PREFIX')
 WALG_SSH_NAMES = ['WALG_SSH_PREFIX', 'SSH_PRIVATE_KEY_PATH', 'SSH_USERNAME', 'SSH_PORT']
 
@@ -189,6 +188,9 @@ bootstrap:
       {{#STANDBY_PORT}}
       port: {{STANDBY_PORT}}
       {{/STANDBY_PORT}}
+      {{#STANDBY_PRIMARY_SLOT_NAME}}
+      primary_slot_name: {{STANDBY_PRIMARY_SLOT_NAME}}
+      {{/STANDBY_PRIMARY_SLOT_NAME}}
     {{/STANDBY_CLUSTER}}
     ttl: 30
     loop_wait: &loop_wait 10
@@ -579,6 +581,7 @@ def get_placeholders(provider):
 
     placeholders.setdefault('LOG_SHIP_SCHEDULE', '1 0 * * *')
     placeholders.setdefault('LOG_S3_BUCKET', '')
+    placeholders.setdefault('LOG_S3_ENDPOINT', '')
     placeholders.setdefault('LOG_TMPDIR', os.path.abspath(os.path.join(placeholders['PGROOT'], '../tmp')))
     placeholders.setdefault('LOG_BUCKET_SCOPE_SUFFIX', '')
 
@@ -612,6 +615,7 @@ def get_placeholders(provider):
     placeholders.setdefault('STANDBY_WITH_WALE', '')
     placeholders.setdefault('STANDBY_HOST', '')
     placeholders.setdefault('STANDBY_PORT', '')
+    placeholders.setdefault('STANDBY_PRIMARY_SLOT_NAME', '')
     placeholders.setdefault('STANDBY_CLUSTER', placeholders['STANDBY_WITH_WALE'] or placeholders['STANDBY_HOST'])
 
     if provider == PROVIDER_AWS and not USE_KUBERNETES:
@@ -647,9 +651,18 @@ def get_placeholders(provider):
         'envdir "{WALE_ENV_DIR}" {WALE_BINARY} wal-push "%p"'.format(**placeholders) \
         if placeholders['USE_WALE'] else '/bin/true'
 
-    if os.path.exists(MEMORY_LIMIT_IN_BYTES_PATH):
-        with open(MEMORY_LIMIT_IN_BYTES_PATH) as f:
+    cgroup_memory_limit_path = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
+    cgroup_v2_memory_limit_path = '/sys/fs/cgroup/memory.max'
+
+    if os.path.exists(cgroup_memory_limit_path):
+        with open(cgroup_memory_limit_path) as f:
             os_memory_mb = int(f.read()) / 1048576
+    elif os.path.exists(cgroup_v2_memory_limit_path):
+        with open(cgroup_v2_memory_limit_path) as f:
+            try:
+                os_memory_mb = int(f.read()) / 1048576
+            except Exception:  # string literal "max" is a possible value
+                os_memory_mb = 0x7FFFFFFFFFF
     else:
         os_memory_mb = sys.maxsize
     os_memory_mb = min(os_memory_mb, os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1048576)
@@ -689,39 +702,38 @@ def pystache_render(*args, **kwargs):
 
 
 def get_dcs_config(config, placeholders):
-    if USE_KUBERNETES and placeholders.get('DCS_ENABLE_KUBERNETES_API'):
-        try:
-            kubernetes_labels = json.loads(placeholders.get('KUBERNETES_LABELS'))
-        except (TypeError, ValueError) as e:
-            logging.warning("could not parse kubernetes labels as a JSON: {0}, "
-                            "reverting to the default: {1}".format(e, KUBERNETES_DEFAULT_LABELS))
-            kubernetes_labels = json.loads(KUBERNETES_DEFAULT_LABELS)
+    # (KUBERNETES|ZOOKEEPER|EXHIBITOR|CONSUL|ETCD3|ETCD)_(HOSTS|HOST|PORT|...)
+    dcs_configs = defaultdict(dict)
+    for name, value in placeholders.items():
+        if '_' not in name:
+            continue
+        dcs, param = name.lower().split('_', 1)
+        if dcs in PATRONI_DCS:
+            if param == 'hosts':
+                if not (value.strip().startswith('-') or '[' in value):
+                    value = '[{0}]'.format(value)
+                value = yaml.safe_load(value)
+            elif param == 'discovery_domain':
+                param = 'discovery_srv'
+            dcs_configs[dcs][param] = value
 
-        config = {'kubernetes': {'role_label': placeholders.get('KUBERNETES_ROLE_LABEL'),
-                                 'scope_label': placeholders.get('KUBERNETES_SCOPE_LABEL'),
-                                 'labels': kubernetes_labels}}
-        if not placeholders.get('KUBERNETES_USE_CONFIGMAPS'):
-            config['kubernetes'].update({'use_endpoints': True, 'pod_ip': placeholders['instance_data']['ip'],
-                                         'ports': [{'port': 5432, 'name': 'postgresql'}]})
-        if str(placeholders.get('KUBERNETES_BYPASS_API_SERVICE')).lower() == 'true':
+    if USE_KUBERNETES and placeholders.get('DCS_ENABLE_KUBERNETES_API'):
+        config = {'kubernetes': dcs_configs['kubernetes']}
+        try:
+            kubernetes_labels = json.loads(config['kubernetes'].get('labels'))
+        except (TypeError, ValueError) as e:
+            logging.warning("could not parse kubernetes labels as a JSON: %r, "
+                            "reverting to the default: %s", e, KUBERNETES_DEFAULT_LABELS)
+            kubernetes_labels = json.loads(KUBERNETES_DEFAULT_LABELS)
+        config['kubernetes']['labels'] = kubernetes_labels
+
+        if not config['kubernetes'].pop('use_configmaps'):
+            config['kubernetes'].update({'use_endpoints': True, 'ports': [{'port': 5432, 'name': 'postgresql'}]})
+        if str(config['kubernetes'].pop('bypass_api_service', None)).lower() == 'true':
             config['kubernetes']['bypass_api_service'] = True
     else:
-        # (ZOOKEEPER|EXHIBITOR|CONSUL|ETCD3|ETCD)_(HOSTS|HOST|PORT|...)
-        dcs_configs = defaultdict(dict)
-        for name, value in placeholders.items():
-            if '_' not in name:
-                continue
-            dcs, param = name.lower().split('_', 1)
-            if dcs in PATRONI_DCS:
-                if param == 'hosts':
-                    if not (value.strip().startswith('-') or '[' in value):
-                        value = '[{0}]'.format(value)
-                    value = yaml.safe_load(value)
-                elif param == 'discovery_domain':
-                    param = 'discovery_srv'
-                dcs_configs[dcs][param] = value
         for dcs in PATRONI_DCS:
-            if dcs in dcs_configs:
+            if dcs != 'kubernetes' and dcs in dcs_configs:
                 config = {dcs: dcs_configs[dcs]}
                 break
         else:
@@ -740,7 +752,8 @@ def write_log_environment(placeholders):
     aws_region = log_env.get('AWS_REGION')
     if not aws_region:
         aws_region = placeholders['instance_data']['zone'][:-1]
-    log_env['LOG_AWS_HOST'] = 's3.{}.amazonaws.com'.format(aws_region)
+
+    log_env['LOG_AWS_REGION'] = aws_region
 
     log_s3_key = 'spilo/{LOG_BUCKET_SCOPE_PREFIX}{SCOPE}{LOG_BUCKET_SCOPE_SUFFIX}/log/'.format(**log_env)
     log_s3_key += placeholders['instance_data']['id']
@@ -753,17 +766,19 @@ def write_log_environment(placeholders):
     if not os.path.exists(log_env['LOG_ENV_DIR']):
         os.makedirs(log_env['LOG_ENV_DIR'])
 
-    for var in ('LOG_TMPDIR', 'LOG_AWS_HOST', 'LOG_S3_KEY', 'LOG_S3_BUCKET', 'PGLOG'):
+    for var in ('LOG_TMPDIR', 'LOG_AWS_REGION', 'LOG_S3_ENDPOINT', 'LOG_S3_KEY', 'LOG_S3_BUCKET', 'PGLOG'):
         write_file(log_env[var], os.path.join(log_env['LOG_ENV_DIR'], var), True)
 
 
 def write_wale_environment(placeholders, prefix, overwrite):
     s3_names = ['WALE_S3_PREFIX', 'WALG_S3_PREFIX', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
                 'WALE_S3_ENDPOINT', 'AWS_ENDPOINT', 'AWS_REGION', 'AWS_INSTANCE_PROFILE', 'WALE_DISABLE_S3_SSE',
-                'WALG_S3_SSE_KMS_ID', 'WALG_S3_SSE', 'WALG_DISABLE_S3_SSE', 'AWS_S3_FORCE_PATH_STYLE']
-    azure_names = ['WALG_AZ_PREFIX', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_ACCESS_KEY',
-                   'AZURE_STORAGE_SAS_TOKEN', 'WALG_AZURE_BUFFER_SIZE', 'WALG_AZURE_MAX_BUFFERS',
+                'WALG_S3_SSE_KMS_ID', 'WALG_S3_SSE', 'WALG_DISABLE_S3_SSE', 'AWS_S3_FORCE_PATH_STYLE', 'AWS_ROLE_ARN',
+                'AWS_WEB_IDENTITY_TOKEN_FILE', 'AWS_STS_REGIONAL_ENDPOINTS']
+    azure_names = ['WALG_AZ_PREFIX', 'AZURE_STORAGE_ACCOUNT',  'WALG_AZURE_BUFFER_SIZE', 'WALG_AZURE_MAX_BUFFERS',
                    'AZURE_ENVIRONMENT_NAME']
+    azure_auth_names = ['AZURE_STORAGE_ACCESS_KEY', 'AZURE_STORAGE_SAS_TOKEN', 'AZURE_CLIENT_ID',
+                        'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID']
     gs_names = ['WALE_GS_PREFIX', 'WALG_GS_PREFIX', 'GOOGLE_APPLICATION_CREDENTIALS']
     swift_names = ['WALE_SWIFT_PREFIX', 'SWIFT_AUTHURL', 'SWIFT_TENANT', 'SWIFT_TENANT_ID', 'SWIFT_USER',
                    'SWIFT_USER_ID', 'SWIFT_USER_DOMAIN_NAME', 'SWIFT_USER_DOMAIN_ID', 'SWIFT_PASSWORD',
@@ -782,7 +797,8 @@ def write_wale_environment(placeholders, prefix, overwrite):
     wale = defaultdict(lambda: '')
     for name in ['PGVERSION', 'PGPORT', 'WALE_ENV_DIR', 'SCOPE', 'WAL_BUCKET_SCOPE_PREFIX', 'WAL_BUCKET_SCOPE_SUFFIX',
                  'WAL_S3_BUCKET', 'WAL_GCS_BUCKET', 'WAL_GS_BUCKET', 'WAL_SWIFT_BUCKET', 'BACKUP_NUM_TO_RETAIN',
-                 'ENABLE_WAL_PATH_COMPAT'] + s3_names + swift_names + gs_names + walg_names + azure_names + ssh_names:
+                 'ENABLE_WAL_PATH_COMPAT'] + s3_names + swift_names + gs_names + walg_names + azure_names + \
+            azure_auth_names + ssh_names:
         wale[name] = placeholders.get(prefix + name, '')
 
     if wale.get('WAL_S3_BUCKET') or wale.get('WALE_S3_PREFIX') or wale.get('WALG_S3_PREFIX'):
@@ -842,7 +858,31 @@ def write_wale_environment(placeholders, prefix, overwrite):
     elif wale.get('WAL_SWIFT_BUCKET') or wale.get('WALE_SWIFT_PREFIX'):
         write_envdir_names = swift_names
     elif wale.get("WALG_AZ_PREFIX"):
-        write_envdir_names = azure_names + walg_names
+        azure_auth = []
+        auth_opts = 0
+
+        if wale.get('AZURE_STORAGE_ACCESS_KEY'):
+            azure_auth.append('AZURE_STORAGE_ACCESS_KEY')
+            auth_opts += 1
+
+        if wale.get('AZURE_STORAGE_SAS_TOKEN'):
+            if auth_opts == 0:
+                azure_auth.append('AZURE_STORAGE_SAS_TOKEN')
+            auth_opts += 1
+
+        if wale.get('AZURE_CLIENT_ID') and wale.get('AZURE_CLIENT_SECRET') and wale.get('AZURE_TENANT_ID'):
+            if auth_opts == 0:
+                azure_auth.extend(['AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID'])
+            auth_opts += 1
+
+        if auth_opts > 1:
+            logging.warning('Multiple authentication options configured for wal-g backup to Azure, using %s. Provide '
+                            'either AZURE_STORAGE_ACCESS_KEY or AZURE_STORAGE_SAS_TOKEN or Service Principal '
+                            '(AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID) for authentication (or use '
+                            'MSI).', '/'.join(azure_auth))
+
+        write_envdir_names = azure_names + azure_auth + walg_names
+
     elif wale.get("WALG_SSH_PREFIX"):
         write_envdir_names = ssh_names + walg_names
     else:
@@ -959,7 +999,7 @@ def write_crontab(placeholders, overwrite):
         lines += [('{LOG_SHIP_SCHEDULE} nice -n 5 envdir "{LOG_ENV_DIR}"' +
                    ' /scripts/upload_pg_log_to_s3.py').format(**placeholders)]
 
-    lines += yaml.load(placeholders['CRONTAB'])
+    lines += yaml.safe_load(placeholders['CRONTAB'])
 
     if len(lines) > 1 or root_lines:
         setup_runit_cron(placeholders)
@@ -1013,12 +1053,13 @@ def main():
 
     provider = get_provider()
     placeholders = get_placeholders(provider)
-    logging.info('Looks like your running %s', provider)
+    logging.info('Looks like you are running %s', provider)
 
-    config = yaml.load(pystache_render(TEMPLATE, placeholders))
+    config = yaml.safe_load(pystache_render(TEMPLATE, placeholders))
     config.update(get_dcs_config(config, placeholders))
 
-    user_config = yaml.load(os.environ.get('SPILO_CONFIGURATION', os.environ.get('PATRONI_CONFIGURATION', ''))) or {}
+    user_config = yaml.safe_load(os.environ.get('SPILO_CONFIGURATION',
+                                                os.environ.get('PATRONI_CONFIGURATION', ''))) or {}
     if not isinstance(user_config, dict):
         config_var_name = 'SPILO_CONFIGURATION' if 'SPILO_CONFIGURATION' in os.environ else 'PATRONI_CONFIGURATION'
         raise ValueError('{0} should contain a dict, yet it is a {1}'.format(config_var_name, type(user_config)))
@@ -1026,7 +1067,7 @@ def main():
     user_config_copy = deepcopy(user_config)
     config = deep_update(user_config_copy, config)
 
-    if provider == PROVIDER_LOCAL and not any(1 for key in config.keys() if key == 'kubernetes' or key in PATRONI_DCS):
+    if provider == PROVIDER_LOCAL and not any(1 for key in config.keys() if key in PATRONI_DCS):
         link_runit_service(placeholders, 'etcd')
         config['etcd'] = {'host': '127.0.0.1:2379'}
 
